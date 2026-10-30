@@ -18,6 +18,16 @@ import {
 import { toast } from "sonner";
 import { api } from "@/convex/_generated/api";
 import { CRYPTO_VERSION, decryptText } from "@/lib/crypto";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
@@ -46,6 +56,18 @@ function getHash() {
 
 function getServerHash() {
   return null;
+}
+
+const CREATED_KEY = "pastery:created";
+
+function isOwnLink(slug: string): boolean {
+  try {
+    const raw = sessionStorage.getItem(CREATED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) && parsed.includes(slug);
+  } catch {
+    return false;
+  }
 }
 
 function errorMessage(err: unknown): string {
@@ -90,9 +112,19 @@ function ViewPaste() {
   const [state, setState] = useState<ViewState>({ kind: "gate" });
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  function handleRevealClick() {
+    if (isOwnLink(slug)) {
+      setConfirmOpen(true);
+      return;
+    }
+    void handleReveal();
+  }
 
   async function handleReveal() {
     if (!key || loading) return;
+    setConfirmOpen(false);
     setLoading(true);
     try {
       const paste = await openPaste({ slug });
@@ -230,7 +262,7 @@ function ViewPaste() {
           <CardFooter className="border-t py-4">
             <Button
               className="h-9"
-              onClick={handleReveal}
+              onClick={handleRevealClick}
               disabled={loading}
               data-testid="reveal-button"
             >
@@ -238,6 +270,23 @@ function ViewPaste() {
               {loading ? "Revealing…" : "Reveal paste"}
             </Button>
           </CardFooter>
+          <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Open your own link?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This is your own link. Opening it will delete it, and the recipient will
+                  not be able to read it.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction variant="destructive" onClick={handleReveal}>
+                  Open anyway
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </Shell>
       );
   }

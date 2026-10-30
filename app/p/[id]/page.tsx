@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   Card,
   CardContent,
@@ -99,7 +100,7 @@ function Shell({
 
 function CreateLink({ label = "Create a new paste" }: { label?: string }) {
   return (
-    <Link href="/" className={buttonVariants({ variant: "outline", className: "h-9" })}>
+    <Link href="/" className={cn(buttonVariants({ variant: "outline", className: "h-9" }))}>
       {label}
     </Link>
   );

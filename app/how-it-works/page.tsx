@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   Card,
   CardContent,
@@ -104,7 +105,7 @@ export default function HowItWorksPage() {
           ))}
         </CardContent>
         <CardFooter className="border-t py-4">
-          <Link href="/" className={buttonVariants({ variant: "outline", className: "h-9" })}>
+          <Link href="/" className={cn(buttonVariants({ variant: "outline", className: "h-9" }))}>
             Create a paste
           </Link>
         </CardFooter>

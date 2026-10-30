@@ -7,6 +7,7 @@ const TTL_MS = 24 * 60 * 60 * 1000;
 // 4000 chars of UTF-8 (up to 4 bytes each) + AES-GCM tag (16) + headroom (64).
 const MAX_CIPHERTEXT_BYTES = 4000 * 4 + 16 + 64;
 const IV_BYTES = 12;
+const KEY_CHECK_BYTES = 16;
 const SLUG_LENGTH = 10;
 const BASE62 =
   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -16,6 +17,16 @@ const rateLimiter = new RateLimiter(components.rateLimiter, {
   createPaste: { kind: "token bucket", rate: 60, period: MINUTE },
   openPaste: { kind: "token bucket", rate: 600, period: MINUTE },
 });
+
+// Constant-time so response timing can't be used to guess the check byte by byte.
+function bytesEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  const x = new Uint8Array(a);
+  const y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
 
 function randomSlug(): string {
   let slug = "";
@@ -32,8 +43,13 @@ function randomSlug(): string {
 }
 
 export const createPaste = mutation({
-  args: { ciphertext: v.bytes(), iv: v.bytes(), version: v.number() },
-  handler: async (ctx, { ciphertext, iv, version }) => {
+  args: {
+    ciphertext: v.bytes(),
+    iv: v.bytes(),
+    version: v.number(),
+    keyCheck: v.bytes(),
+  },
+  handler: async (ctx, { ciphertext, iv, version, keyCheck }) => {
     await rateLimiter.limit(ctx, "createPaste", { throws: true });
 
     if (ciphertext.byteLength === 0) {
@@ -44,6 +60,9 @@ export const createPaste = mutation({
     }
     if (iv.byteLength !== IV_BYTES) {
       throw new ConvexError("Invalid IV length");
+    }
+    if (keyCheck.byteLength !== KEY_CHECK_BYTES) {
+      throw new ConvexError("Invalid key check length");
     }
 
     let slug = randomSlug();
@@ -63,6 +82,7 @@ export const createPaste = mutation({
       iv,
       version,
       expiresAt,
+      keyCheck,
     });
     const cleanupJobId = await ctx.scheduler.runAt(
       expiresAt,
@@ -90,18 +110,26 @@ export const peekPaste = query({
 });
 
 export const openPaste = mutation({
-  args: { slug: v.string() },
-  handler: async (ctx, { slug }) => {
+  args: { slug: v.string(), keyCheck: v.bytes() },
+  handler: async (ctx, { slug, keyCheck }) => {
     await rateLimiter.limit(ctx, "openPaste", { throws: true });
 
     const paste = await ctx.db
       .query("pastes")
       .withIndex("by_slug", (q) => q.eq("slug", slug))
       .unique();
-    if (!paste) return null;
+    if (!paste) return { status: "gone" as const };
     if (paste.expiresAt <= Date.now()) {
       await ctx.db.delete(paste._id);
-      return null;
+      return { status: "gone" as const };
+    }
+
+    // Key commitment: a link whose key doesn't match what the creator committed
+    // to can never decrypt this paste, so refuse it and leave the row in place
+    // rather than burning it. Rows without a keyCheck predate this and still
+    // burn on open.
+    if (paste.keyCheck && !bytesEqual(paste.keyCheck, keyCheck)) {
+      return { status: "badKey" as const };
     }
 
     if (paste.cleanupJobId) {
@@ -109,6 +137,7 @@ export const openPaste = mutation({
     }
     await ctx.db.delete(paste._id);
     return {
+      status: "ok" as const,
       ciphertext: paste.ciphertext,
       iv: paste.iv,
       version: paste.version,

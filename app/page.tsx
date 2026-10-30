@@ -8,6 +8,8 @@ import { Check, Copy, Flame, Loader2, Lock, Timer } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/convex/_generated/api";
 import { encryptText } from "@/lib/crypto";
+import { base64UrlDecode } from "@/lib/encoding";
+import { computeKeyCheck } from "@/lib/linkKey";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -57,10 +59,12 @@ export default function Home() {
     setLoading(true);
     try {
       const { ciphertext, iv, key, version } = await encryptText(text);
+      const keyCheck = await computeKeyCheck(base64UrlDecode(key));
       const { slug } = await createPaste({
         ciphertext: toArrayBuffer(ciphertext),
         iv: toArrayBuffer(iv),
         version,
+        keyCheck: toArrayBuffer(keyCheck),
       });
       rememberCreated(slug);
       setLink(`${location.origin}/p/${slug}#${key}`);

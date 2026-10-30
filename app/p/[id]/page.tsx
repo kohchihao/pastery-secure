@@ -3,7 +3,7 @@
 import { Suspense, useState, useSyncExternalStore, type ReactNode } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useMutation } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { ConvexError } from "convex/values";
 import {
   Check,
@@ -18,6 +18,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/convex/_generated/api";
 import { CRYPTO_VERSION, decryptText } from "@/lib/crypto";
+import { parseLinkKey } from "@/lib/linkKey";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -43,7 +44,8 @@ import {
 type ViewState =
   | { kind: "gate" }
   | { kind: "gone" }
-  | { kind: "damaged" }
+  // burned: whether the server deleted the paste before we found out the link was bad.
+  | { kind: "damaged"; burned: boolean }
   | { kind: "revealed"; content: string };
 
 function subscribeHash(onChange: () => void) {
@@ -69,6 +71,10 @@ function isOwnLink(slug: string): boolean {
   } catch {
     return false;
   }
+}
+
+function toArrayBuffer(bytes: Uint8Array<ArrayBuffer>): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
 function errorMessage(err: unknown): string {
@@ -106,6 +112,19 @@ function CreateLink({ label = "Create a new paste" }: { label?: string }) {
   );
 }
 
+function GoneScreen() {
+  return (
+    <Shell
+      title="This paste is gone"
+      description="It may have been opened already, expired, or never existed."
+    >
+      <CardFooter className="border-t py-4">
+        <CreateLink />
+      </CardFooter>
+    </Shell>
+  );
+}
+
 function ViewPaste() {
   const { id: slug } = useParams<{ id: string }>();
   const key = useSyncExternalStore(subscribeHash, getHash, getServerHash);
@@ -114,6 +133,14 @@ function ViewPaste() {
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // Reactive and ciphertext-free: lets the gate say "gone" up front (and flip to
+  // it if someone else opens the paste meanwhile) without burning anything.
+  // Skipped without a key so the missing-key screen wins, and once we've left
+  // the gate so our own reveal doesn't re-render as "gone".
+  const peek = useQuery(
+    api.pastes.peekPaste,
+    key && state.kind === "gate" ? { slug } : "skip",
+  );
 
   function handleRevealClick() {
     if (isOwnLink(slug)) {
@@ -128,9 +155,22 @@ function ViewPaste() {
     setConfirmOpen(false);
     setLoading(true);
     try {
-      const paste = await openPaste({ slug });
-      if (!paste) {
+      // Check the fragment locally first: a truncated or mangled key can never
+      // decrypt, so don't ask the server to burn the paste for it.
+      const parsed = await parseLinkKey(key);
+      if (!parsed) {
+        setState({ kind: "damaged", burned: false });
+        return;
+      }
+      const paste = await openPaste({ slug, keyCheck: toArrayBuffer(parsed.keyCheck) });
+      if (paste.status === "gone") {
         setState({ kind: "gone" });
+        return;
+      }
+      if (paste.status === "badKey") {
+        // Well-formed key that doesn't match the paste's key commitment; the
+        // server left the paste in place.
+        setState({ kind: "damaged", burned: false });
         return;
       }
       try {
@@ -142,7 +182,8 @@ function ViewPaste() {
         );
         setState({ kind: "revealed", content });
       } catch {
-        setState({ kind: "damaged" });
+        // Only reachable for pastes without a key commitment, or tampered data.
+        setState({ kind: "damaged", burned: true });
       }
     } catch (err) {
       toast.error(errorMessage(err));
@@ -191,16 +232,7 @@ function ViewPaste() {
 
   switch (state.kind) {
     case "gone":
-      return (
-        <Shell
-          title="This paste is gone"
-          description="It may have been opened already, expired, or never existed."
-        >
-          <CardFooter className="border-t py-4">
-            <CreateLink />
-          </CardFooter>
-        </Shell>
-      );
+      return <GoneScreen />;
 
     case "damaged":
       return (
@@ -210,10 +242,17 @@ function ViewPaste() {
         >
           <CardContent className="flex items-start gap-2 text-sm text-muted-foreground">
             <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-            <span>
-              The link may have been cut off or altered when it was shared. The paste has
-              been deleted from the server, so ask the sender to create a new one.
-            </span>
+            {state.burned ? (
+              <span>
+                The link may have been cut off or altered when it was shared. The paste has
+                been deleted from the server, so ask the sender to create a new one.
+              </span>
+            ) : (
+              <span>
+                The link may have been cut off or altered when it was shared. The paste
+                hasn&apos;t been opened, so ask the sender to send you the full link again.
+              </span>
+            )}
           </CardContent>
           <CardFooter className="border-t py-4">
             <CreateLink />
@@ -249,6 +288,9 @@ function ViewPaste() {
       );
 
     case "gate":
+      // While peekPaste loads we show the gate; once it says the paste is gone
+      // (opened, expired or never existed) show that instead of a dead button.
+      if (peek && !peek.exists) return <GoneScreen />;
       return (
         <Shell
           title="Someone sent you an encrypted paste"

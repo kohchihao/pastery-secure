@@ -1,4 +1,5 @@
-// End-to-end walkthrough that captures screenshots of every screen.
+// End-to-end walkthrough that captures screenshots of every screen and checks
+// that burned links show "gone" up front and damaged links don't burn pastes.
 // Usage: start the app (npm run build && npm run start -- -p 3123), then
 //   node scripts/screenshots.mjs [baseUrl]
 import { mkdir } from "node:fs/promises";
@@ -81,8 +82,8 @@ async function run(browser, vp) {
   if (content !== SAMPLE) throw new Error(`Decrypted content mismatch:\n${content}`);
   await shot(recipient.page, `${vp}-4-revealed`);
 
+  // Reloading after reveal: the gate's precheck already knows it's gone.
   await recipient.page.reload({ waitUntil: "networkidle" });
-  await recipient.page.getByTestId("reveal-button").click();
   await recipient.page
     .getByText("This paste is gone")
     .waitFor({ state: "visible", timeout: 15_000 });
@@ -91,6 +92,65 @@ async function run(browser, vp) {
   await recipient.page.goto(link.split("#")[0], { waitUntil: "networkidle" });
   await recipient.page.getByText("Missing key in the link").waitFor({ state: "visible" });
   await shot(recipient.page, `${vp}-6-missing-key`);
+
+  // Already-burned link in a fresh context: the gate's peekPaste check should
+  // show "gone" straight away, without anyone clicking Reveal.
+  const latecomer = await newPage(browser, viewport, `${vp}/latecomer`);
+  await latecomer.page.goto(link, { waitUntil: "networkidle" });
+  await latecomer.page
+    .getByText("This paste is gone")
+    .waitFor({ state: "visible", timeout: 15_000 });
+  if (await latecomer.page.getByTestId("reveal-button").count()) {
+    throw new Error("Reveal button still shown for a burned paste");
+  }
+  await shot(latecomer.page, `${vp}-9-gone-before-reveal`);
+  await latecomer.context.close();
+
+  // Damaged link: a fresh paste opened with a corrupted key must not burn it.
+  await creator.page.goto(BASE, { waitUntil: "networkidle" });
+  await creator.page.getByTestId("create-textarea").fill(SAMPLE);
+  await creator.page.getByTestId("create-button").click();
+  await linkInput.waitFor({ state: "visible", timeout: 15_000 });
+  const goodLink = await linkInput.inputValue();
+  const [base, key] = goodLink.split("#");
+  // Swap a middle character: still valid 43-char base64url, but a different
+  // 32-byte key, so it gets past the local check and hits the server's keyCheck.
+  const i = 10;
+  const wrongKey = key.slice(0, i) + (key[i] === "A" ? "B" : "A") + key.slice(i + 1);
+  const damagedLinks = [
+    `${base}#${wrongKey}`, // well-formed but wrong: rejected server-side
+    `${base}#${key.slice(0, 30)}`, // truncated: rejected before openPaste
+  ];
+
+  for (const [n, damagedLink] of damagedLinks.entries()) {
+    // Fresh context per link: a hash-only change would be a same-document navigation.
+    const damaged = await newPage(browser, viewport, `${vp}/damaged-${n}`);
+    await damaged.page.goto(damagedLink, { waitUntil: "networkidle" });
+    await damaged.page.getByTestId("reveal-button").click();
+    await damaged.page
+      .getByText("This link looks damaged")
+      .waitFor({ state: "visible", timeout: 15_000 });
+    await damaged.page.getByText("The paste hasn't been opened").waitFor({ state: "visible" });
+    if (n === 0) await shot(damaged.page, `${vp}-10-damaged-link`);
+    await damaged.context.close();
+  }
+
+  const survivor = await newPage(browser, viewport, `${vp}/survivor`);
+  await survivor.page.goto(goodLink, { waitUntil: "networkidle" });
+  const survivorGate = survivor.page.getByTestId("reveal-button");
+  const burned = survivor.page.getByText("This paste is gone");
+  const burnedError = new Error("Damaged-link attempts burned the paste");
+  await survivorGate.or(burned).waitFor({ state: "visible", timeout: 15_000 });
+  if (await burned.isVisible()) throw burnedError;
+  await survivorGate.click();
+  const survived = survivor.page.getByTestId("revealed-content");
+  await survived.or(burned).waitFor({ state: "visible", timeout: 15_000 });
+  if (await burned.isVisible()) throw burnedError;
+  if ((await survived.textContent()) !== SAMPLE) {
+    throw new Error("Decrypted content mismatch after damaged-link attempts");
+  }
+  console.log("  ✓ damaged links left the paste intact");
+  await survivor.context.close();
 
   if (vp === "desktop") {
     await creator.page.goto(`${BASE}/how-it-works`, { waitUntil: "networkidle" });

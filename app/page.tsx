@@ -111,6 +111,7 @@ export default function Home() {
                   readOnly
                   value={link}
                   aria-label="Shareable link"
+                  data-testid="share-link"
                   className="h-9 font-mono text-xs"
                   onFocus={(e) => e.currentTarget.select()}
                 />
@@ -146,6 +147,7 @@ export default function Home() {
                 rows={12}
                 placeholder="Paste your secret here…"
                 aria-label="Secret text"
+                data-testid="create-textarea"
                 className="min-h-72 resize-y font-mono text-sm"
                 disabled={loading}
               />
@@ -154,7 +156,12 @@ export default function Home() {
               </p>
             </CardContent>
             <CardFooter className="flex flex-col items-stretch gap-3 border-t py-4">
-              <Button type="submit" className="h-9" disabled={!text || loading}>
+              <Button
+                type="submit"
+                className="h-9"
+                disabled={!text || loading}
+                data-testid="create-button"
+              >
                 {loading && <Loader2 className="animate-spin" />}
                 {loading ? "Encrypting…" : "Create encrypted link"}
               </Button>

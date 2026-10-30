@@ -8,6 +8,9 @@ export default defineSchema({
     iv: v.bytes(),
     version: v.number(),
     expiresAt: v.number(),
+    // 16-byte key commitment (see lib/linkKey.ts). Absent on rows created
+    // before it existed; those keep the burn-on-open behaviour.
+    keyCheck: v.optional(v.bytes()),
     cleanupJobId: v.optional(v.id("_scheduled_functions")),
   })
     .index("by_slug", ["slug"])

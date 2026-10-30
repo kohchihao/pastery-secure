@@ -9,11 +9,14 @@ Paste some text (up to 4,000 characters) and get a link. Your browser encrypts t
 All encryption and decryption happens in the browser using the [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API) (`lib/crypto.ts`).
 
 1. **Create.** The browser generates a fresh random AES-256-GCM key and a random 12-byte IV, then encrypts the UTF-8 text.
-2. **Upload.** Only the ciphertext, the IV and a format version (`1`) go to the `createPaste` Convex mutation. The server returns a random 10-character base62 slug.
+2. **Upload.** Only the ciphertext, the IV, a format version (`1`) and a 16-byte key check go to the `createPaste` Convex mutation. The key check is the first 16 bytes of `SHA-256("pastery-keycheck-v1" || rawKey)` (`lib/linkKey.ts`). The server returns a random 10-character base62 slug.
 3. **Share.** The link has the form `https://<host>/p/<slug>#<key>`, where `<key>` is the raw key encoded as 43-character base64url. Browsers don't send the URL fragment (the part after `#`) in requests, so the key never reaches the server.
-4. **Open.** The recipient clicks **Reveal paste**. That calls the `openPaste` mutation, which deletes the row and returns the ciphertext and IV in the same transaction. The browser then decrypts them with the key from the fragment. If decryption fails (wrong or truncated key, tampered data, unknown version), the page reports the link as damaged. By then the paste has already been deleted.
+4. **Gate.** The reveal page subscribes to the `peekPaste` query, which only says whether the slug exists and hasn't expired (it never returns ciphertext). If the paste is already gone, the page says so straight away instead of offering a Reveal button that can't work. The check is reactive, so if someone else opens the paste while the page is open, it switches to "gone".
+5. **Open.** The recipient clicks **Reveal paste**. The browser first checks the fragment locally: it must be base64url that decodes to exactly 32 bytes and imports as an AES key. If it doesn't, the page reports the link as damaged and never contacts the server. Otherwise it calls `openPaste(slug, keyCheck)`. If the key check doesn't match the stored one, the server returns `badKey` and leaves the paste alone; the page reports the link as damaged. If it matches, the server deletes the row and returns the ciphertext and IV in the same transaction, and the browser decrypts them with the key from the fragment.
 
-The server stores the ciphertext, IV, version, slug, expiry time and a scheduled-cleanup job ID. It never sees the key or the plaintext.
+A damaged link (truncated, mangled or otherwise wrong key) therefore doesn't burn the paste: the sender can resend the correct link and it still works. The only case where a paste is deleted and then fails to decrypt is tampered ciphertext or an unknown version, or a paste created before key checks existed (those rows have no `keyCheck` and keep the old burn-on-open behaviour).
+
+The server stores the ciphertext, IV, version, key check, slug, expiry time and a scheduled-cleanup job ID. It never sees the key or the plaintext. The key check doesn't weaken this: the key is 256 random bits, so a truncated SHA-256 of it can't be brute-forced or used to decrypt anything.
 
 ```mermaid
 sequenceDiagram
@@ -21,11 +24,13 @@ sequenceDiagram
     participant C as Convex
     participant R as Recipient browser
     S->>S: generate AES-256-GCM key + 12-byte IV, encrypt text
-    S->>C: createPaste(ciphertext, iv, version)
+    S->>C: createPaste(ciphertext, iv, version, keyCheck)
     C-->>S: slug
     S->>R: share /p/slug#key (out of band)
-    R->>C: openPaste(slug)  — fragment is never sent
-    C->>C: delete row
+    R->>C: peekPaste(slug)  — exists? (no ciphertext)
+    R->>R: validate #key locally, compute keyCheck
+    R->>C: openPaste(slug, keyCheck)  — fragment is never sent
+    C->>C: keyCheck matches? delete row : return badKey
     C-->>R: ciphertext, iv, version
     R->>R: decrypt with key from #fragment
 ```
@@ -33,7 +38,7 @@ sequenceDiagram
 ## Security model and limits
 
 - **The link is the secret.** Anyone who has the full link, fragment included, can read the paste once. If someone else opens it first, the intended recipient will only see "This paste is gone".
-- **Burn on first open.** `openPaste` deletes the paste before returning it. Each paste can be read once, no more. The reveal page waits for an explicit click, so link previewers that only fetch the page don't burn it. If you open a link you created in the same browser session, the app asks you to confirm first. It tracks your links in `sessionStorage`.
+- **Burn on first open.** `openPaste` deletes the paste before returning it. Each paste can be read once, no more. The reveal page waits for an explicit click, so link previewers that only fetch the page don't burn it. Only a request carrying the right key check burns a paste, so a damaged link, or someone who knows just the slug, can't destroy it. If you open a link you created in the same browser session, the app asks you to confirm first. It tracks your links in `sessionStorage`.
 - **24-hour lifetime.** Each paste schedules its own deletion at `expiresAt`. As a safety net, an hourly cron (`sweepExpired`) deletes any expired rows that are left, 100 at a time.
 - **Size cap.** The UI limits input to 4,000 characters. The server rejects empty ciphertext, ciphertext over 16,080 bytes (4,000 × 4 UTF-8 bytes + 16-byte GCM tag + 64 bytes headroom), and any IV that isn't exactly 12 bytes.
 - **Rate limits** (`@convex-dev/rate-limiter`, token buckets):
@@ -75,8 +80,10 @@ convex/
 lib/
   crypto.ts                AES-256-GCM encrypt/decrypt, key import/export
   encoding.ts              base64url encode/decode
+  linkKey.ts               Fragment validation + key check (commitment) helper
 scripts/screenshots.mjs    Playwright end-to-end walkthrough + screenshots
 tests/crypto.test.ts       Vitest tests for crypto and encoding
+tests/linkKey.test.ts      Vitest tests for fragment validation and the key check
 screenshots/               Generated screenshots (desktop + mobile)
 next.config.ts             CSP and security headers
 ```
@@ -93,6 +100,7 @@ next.config.ts             CSP and security headers
 | `version`      | `number`                         | Crypto format version (currently `1`) |
 | `expiresAt`    | `number`                         | ms timestamp, creation + 24h          |
 | `cleanupJobId` | `Id<"_scheduled_functions">?`    | Scheduled deletion job                |
+| `keyCheck`     | `bytes?`                         | 16-byte key commitment; absent on older rows |
 
 Indexes: `by_slug`, `by_expiresAt`.
 
@@ -100,9 +108,9 @@ Indexes: `by_slug`, `by_expiresAt`.
 
 | Function        | Kind               | What it does                                                                                                   |
 | --------------- | ------------------ | -------------------------------------------------------------------------------------------------------------- |
-| `createPaste`   | public mutation    | Rate-limits, checks the sizes, generates a unique slug, inserts the row, schedules `deletePaste` at `expiresAt` |
-| `openPaste`     | public mutation    | Rate-limits, looks up by slug, cancels the scheduled cleanup, deletes the row, returns ciphertext/iv/version (or `null`) |
-| `peekPaste`     | public query       | Returns whether a slug exists and hasn't expired, plus `expiresAt` (currently unused by the UI)                    |
+| `createPaste`   | public mutation    | Rate-limits, checks the sizes (`keyCheck` must be 16 bytes), generates a unique slug, inserts the row, schedules `deletePaste` at `expiresAt` |
+| `openPaste`     | public mutation    | Takes `slug` and `keyCheck`. Rate-limits and looks up by slug. Returns `{status: "gone"}` if missing/expired, or `{status: "badKey"}` without deleting if the row has a `keyCheck` that doesn't match. Otherwise cancels the scheduled cleanup, deletes the row and returns `{status: "ok", ciphertext, iv, version}` |
+| `peekPaste`     | public query       | Returns whether a slug exists and hasn't expired, plus `expiresAt`. Never returns ciphertext. The reveal page subscribes to it to show "gone" before Reveal |
 | `deletePaste`   | internal mutation  | Scheduled per-paste deletion                                                                                   |
 | `sweepExpired`  | internal mutation  | Deletes up to 100 expired rows. If more remain, it schedules itself again. Runs hourly from `crons.ts`      |
 
@@ -139,7 +147,7 @@ npm run dev      # http://localhost:3000
 | `npm run lint`  | Run ESLint                           |
 | `npm test`      | Run the Vitest unit tests once       |
 
-**Screenshots / end-to-end walkthrough.** `scripts/screenshots.mjs` isn't an npm script. It runs a full create → share → reveal → gone → missing-key flow in Playwright Chromium at desktop (1280×800) and mobile (390×844) sizes. It checks that the decrypted text matches what was entered, and saves PNGs to `screenshots/`. It exits non-zero on any console error, page error or failed request.
+**Screenshots / end-to-end walkthrough.** `scripts/screenshots.mjs` isn't an npm script. It runs a full create → share → reveal → gone → missing-key flow in Playwright Chromium at desktop (1280×800) and mobile (390×844) sizes. It also opens an already-burned link in a fresh browser (it must show "gone" without a click) and tries a paste with a wrong key and a truncated key (both must show "damaged"), then checks that the correct link still reveals the paste. It checks that the decrypted text matches what was entered, and saves PNGs to `screenshots/`. It exits non-zero on any console error, page error or failed request.
 
 ```bash
 npx playwright install chromium         # once
@@ -161,6 +169,10 @@ node scripts/screenshots.mjs http://localhost:3000   # or pass a base URL (or se
 | Already opened | Own-link confirmation |
 | -------------- | --------------------- |
 | ![Paste is gone](screenshots/desktop-5-gone.png) | ![Own-link confirmation](screenshots/desktop-8-own-link-confirm.png) |
+
+| Gone, before Reveal | Damaged link (paste kept) |
+| ------------------- | ------------------------- |
+| ![Gone before reveal](screenshots/desktop-9-gone-before-reveal.png) | ![Damaged link](screenshots/desktop-10-damaged-link.png) |
 
 Mobile:
 
